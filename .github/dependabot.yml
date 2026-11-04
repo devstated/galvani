@@ -1,0 +1,22 @@
+version: 2
+updates:
+  # Pinned GitHub Action SHAs
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # Base images referenced in image/Dockerfile and template/ compose files.
+  # (Patch-level updates of floating tags are picked up by the weekly rebuild.)
+  - package-ecosystem: docker
+    directory: /image
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: docker-compose
+    directory: /template
+    schedule:
+      interval: weekly

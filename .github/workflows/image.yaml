@@ -1,0 +1,192 @@
+# Build, test, scan, publish and sign the Galvani base image.
+#
+#   push to main      -> :edge / :edge-dev           (for testing, never used by apps)
+#   tag vX.Y.Z        -> :X.Y.Z :X.Y :X (+ -dev)     (what apps consume: FROM ...:1)
+#   weekly schedule   -> rebuilds the LATEST RELEASED tag with fresh upstream layers
+#                        (PHP/FrankenPHP/Debian security fixes) and moves :X.Y.Z :X.Y :X
+#   pull request      -> build + smoke test + scan only, nothing is pushed
+#
+# Third-party actions are pinned to full commit SHAs (supply-chain hardening);
+# Dependabot keeps them up to date (.github/dependabot.yml).
+
+name: image
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  pull_request:
+  schedule:
+    - cron: "17 4 * * 1" # Mondays 04:17 UTC
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: image-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    name: ${{ matrix.variant }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write # push to ghcr.io
+      id-token: write # keyless cosign signing (Sigstore OIDC)
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [prod, dev]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve version and image name
+        id: v
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          version=""
+          if [ "$REF_TYPE" = "tag" ]; then
+            version="$REF_NAME"
+          elif [ "$EVENT" = "schedule" ] || [ "$EVENT" = "workflow_dispatch" ]; then
+            version="$(git tag --list 'v*.*.*' --sort=-v:refname | head -n1)"
+            if [ -n "$version" ]; then
+              git checkout --quiet "refs/tags/$version"
+            fi
+          fi
+          push=false
+          if [ "$EVENT" != "pull_request" ] && { [ -n "$version" ] || [ "$REF_NAME" = "main" ]; }; then
+            push=true
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "push=$push" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${OWNER,,}/galvani-php" >> "$GITHUB_OUTPUT"
+          echo "suffix=$([ "${{ matrix.variant }}" = dev ] && echo -dev || true)" >> "$GITHUB_OUTPUT"
+          echo "Version: ${version:-<none>}  push: $push"
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ steps.v.outputs.image }}
+          flavor: |
+            latest=false
+            suffix=${{ steps.v.outputs.suffix }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ steps.v.outputs.version }},enable=${{ steps.v.outputs.version != '' }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.v.outputs.version }},enable=${{ steps.v.outputs.version != '' }}
+            type=semver,pattern={{major}},value=${{ steps.v.outputs.version }},enable=${{ steps.v.outputs.version != '' }}
+            type=raw,value=edge,enable=${{ steps.v.outputs.version == '' && github.ref_name == 'main' }}
+            type=ref,event=pr
+          labels: |
+            org.opencontainers.image.title=galvani-php
+            org.opencontainers.image.description=Hardened FrankenPHP (worker mode + Mercure) base image for Symfony 8
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # 1) Build and load locally for testing & scanning.
+      - name: Build (test copy)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: image
+          target: ${{ matrix.variant }}
+          platforms: linux/amd64
+          load: true
+          pull: true
+          no-cache: ${{ github.event_name == 'schedule' }}
+          tags: galvani-php:test
+          cache-from: type=gha,scope=${{ matrix.variant }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.variant }}
+
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          S="$(openssl rand -hex 32)"
+          ENVS=(-e "APP_SECRET=$S" -e "MERCURE_PUBLISHER_JWT_KEY=$S" -e "MERCURE_SUBSCRIBER_JWT_KEY=$S")
+          HARDEN=(--security-opt no-new-privileges:true --cap-drop ALL --read-only --tmpfs /tmp --tmpfs /data:mode=1777 --tmpfs /config:mode=1777)
+
+          echo "::group::Caddyfile is valid (worker on/off)"
+          docker run --rm "${ENVS[@]}" galvani-php:test frankenphp validate --config /etc/frankenphp/Caddyfile --adapter caddyfile
+          docker run --rm "${ENVS[@]}" -e GALVANI_WORKER_MODE=off galvani-php:test frankenphp validate --config /etc/frankenphp/Caddyfile --adapter caddyfile
+          echo "::endgroup::"
+
+          echo "::group::Server starts with zero capabilities and becomes healthy"
+          mkdir -p /tmp/app/public && echo '<?php echo "ok";' > /tmp/app/public/index.php
+          docker run -d --name smoke "${HARDEN[@]}" "${ENVS[@]}" -e GALVANI_WORKER_MODE=off -v /tmp/app:/app:ro -p 127.0.0.1:8080:8080 galvani-php:test
+          for i in $(seq 1 30); do docker exec smoke galvani-healthcheck && break; sleep 1; done
+          docker exec smoke galvani-healthcheck
+          test "$(curl -fsS http://127.0.0.1:8080/)" = "ok"
+          curl -fsSI http://127.0.0.1:8080/ | grep -qi '^x-content-type-options: nosniff'
+          ! curl -fsSI http://127.0.0.1:8080/ | grep -qi '^server:'
+          docker rm -f smoke
+          echo "::endgroup::"
+
+          if [ "${{ matrix.variant }}" = "prod" ]; then
+            echo "::group::Prod refuses to start without secrets"
+            if docker run --rm galvani-php:test; then echo "started without secrets!"; exit 1; fi
+            echo "::endgroup::"
+            echo "::group::Prod runs as non-root"
+            test "$(docker run --rm --entrypoint id galvani-php:test -u)" = "33"
+            echo "::endgroup::"
+          fi
+
+      - name: Vulnerability scan (Trivy)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: galvani-php:test
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+          format: table
+          trivyignores: .trivyignore
+
+      # 2) Push, amd64 only (layers come from the cache of step 1).
+      #    Need ARM servers? Add docker/setup-qemu-action before Buildx and
+      #    linux/arm64 below. Builds then take ~3-4x longer (ARM is emulated).
+      - name: Log in to ghcr.io
+        if: steps.v.outputs.push == 'true'
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: push
+        if: steps.v.outputs.push == 'true'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: image
+          target: ${{ matrix.variant }}
+          platforms: linux/amd64
+          push: true
+          pull: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha,scope=${{ matrix.variant }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.variant }}
+
+      - name: Install cosign
+        if: steps.v.outputs.push == 'true'
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign image (keyless)
+        if: steps.v.outputs.push == 'true'
+        env:
+          IMAGE: ${{ steps.v.outputs.image }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"

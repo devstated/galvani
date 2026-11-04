@@ -1,0 +1,4 @@
+# Vulnerabilities accepted after review. One ID per line, ALWAYS with a reason
+# and a review date, e.g.:
+#
+# CVE-2099-12345  # not reachable: affects only the X CLI, unused at runtime (review 2027-01-01)

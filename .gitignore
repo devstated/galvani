@@ -1,0 +1,16 @@
+# Local overrides and secrets — never commit
+.env
+.env.*
+!.env.example
+*.local
+*.local.yaml
+
+# Smoke-test scratch app
+/.smoke/
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

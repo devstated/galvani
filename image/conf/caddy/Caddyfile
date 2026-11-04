@@ -1,0 +1,124 @@
+# Galvani — FrankenPHP / Caddy configuration
+#
+# Design:
+#   * Plain HTTP on :8080 only. TLS is terminated by the reverse proxy in front of the
+#     container (Coolify/Traefik in production). No ACME, no privileged ports, no root.
+#   * Caddy admin API disabled by default (set GALVANI_CADDY_ADMIN=127.0.0.1:2019 to enable).
+#   * Health endpoint on 127.0.0.1:2020 (loopback only, never routed by the proxy).
+#   * Worker mode toggled with GALVANI_WORKER_MODE=on|off.
+#
+# Environment knobs (parse-time, {$VAR}):
+#   GALVANI_HTTP_PORT, GALVANI_WORKER_MODE, GALVANI_TRUSTED_PROXIES, GALVANI_MAX_BODY_SIZE,
+#   GALVANI_CADDY_ADMIN, GALVANI_HSTS, CADDY_GLOBAL_OPTIONS, CADDY_EXTRA_CONFIG,
+#   CADDY_SERVER_EXTRA_DIRECTIVES, FRANKENPHP_CONFIG, FRANKENPHP_WORKER_CONFIG,
+#   MERCURE_TRUSTED_ISSUERS, MERCURE_EXTRA_DIRECTIVES
+# Runtime secrets ({env.VAR}): MERCURE_PUBLISHER_JWT_KEY, MERCURE_SUBSCRIBER_JWT_KEY
+{
+	admin {$GALVANI_CADDY_ADMIN:off}
+	auto_https off
+	skip_install_trust
+	persist_config off
+
+	servers {
+		# Trust X-Forwarded-* only from the reverse proxy (private networks by default).
+		# Required for correct client IPs and for Mercure to derive its public https:// URL.
+		trusted_proxies static {$GALVANI_TRUSTED_PROXIES:private_ranges}
+		trusted_proxies_strict
+		client_ip_headers X-Forwarded-For X-Real-IP
+	}
+
+	{$CADDY_GLOBAL_OPTIONS}
+
+	frankenphp {
+		{$FRANKENPHP_CONFIG}
+	}
+}
+
+{$CADDY_EXTRA_CONFIG}
+
+# Loopback-only health endpoint used by container healthchecks.
+http://127.0.0.1:2020 {
+	bind 127.0.0.1
+	respond /healthz "OK" 200
+	respond 404
+}
+
+:{$GALVANI_HTTP_PORT:8080} {
+	log {
+		format filter {
+			# Never log Mercure tokens, auth headers or cookies.
+			request>uri query {
+				replace authorization REDACTED
+			}
+			request>headers>Authorization delete
+			request>headers>Cookie delete
+			resp_headers>Set-Cookie delete
+		}
+	}
+
+	root /app/public
+
+	request_body {
+		max_size {$GALVANI_MAX_BODY_SIZE:32MB}
+	}
+
+	# Compressed SSE streams cost memory per subscriber and enable BREACH-style attacks.
+	@compressible not path /.well-known/mercure*
+	encode @compressible zstd br gzip
+
+	header {
+		-Server
+		-X-Powered-By
+		# Defaults only (`?`): the application may set its own values.
+		?X-Content-Type-Options "nosniff"
+		?X-Frame-Options "SAMEORIGIN"
+		?Referrer-Policy "strict-origin-when-cross-origin"
+		?Cross-Origin-Opener-Policy "same-origin"
+		?Permissions-Policy "browsing-topics=(), camera=(), microphone=(), geolocation=(), payment=()"
+		# Ignored by browsers over plain HTTP (dev), effective behind the TLS proxy (prod).
+		?Strict-Transport-Security "{$GALVANI_HSTS:max-age=31536000}"
+		defer
+	}
+
+	mercure {
+		# Trusted issuer: tokens must carry this value in their `iss` claim.
+		# Production: MERCURE_TRUSTED_ISSUERS=https://<APP_DOMAIN>
+		issuer {$MERCURE_TRUSTED_ISSUERS:https://localhost} {
+			publisher {
+				jwt {env.MERCURE_PUBLISHER_JWT_KEY} {env.MERCURE_PUBLISHER_JWT_ALG}
+			}
+			subscriber {
+				jwt {env.MERCURE_SUBSCRIBER_JWT_KEY} {env.MERCURE_SUBSCRIBER_JWT_ALG}
+			}
+		}
+		# Secure by default: no anonymous subscribers, no subscription API.
+		# Opt in via MERCURE_EXTRA_DIRECTIVES (e.g. "anonymous", "subscriptions",
+		# "cors_origins https://example.com", "transport local").
+		{$MERCURE_EXTRA_DIRECTIVES}
+	}
+
+	# Long-lived immutable caching for AssetMapper's digested files.
+	@immutableAssets {
+		path /assets/*
+		file
+	}
+	header @immutableAssets Cache-Control "public, max-age=31536000, immutable"
+
+	{$CADDY_SERVER_EXTRA_DIRECTIVES}
+
+	@phpRoute {
+		not path /.well-known/mercure*
+		not file {path}
+	}
+	rewrite @phpRoute /index.php
+
+	@frontController path /index.php
+	php @frontController {
+		import /etc/frankenphp/galvani/worker-{$GALVANI_WORKER_MODE:on}.caddy
+	}
+
+	# Static files only; never serve PHP sources or server config files.
+	file_server {
+		hide *.php .ht* .git .env*
+	}
+}

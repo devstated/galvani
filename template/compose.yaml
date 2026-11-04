@@ -1,0 +1,239 @@
+# Galvani stack — PRODUCTION base.
+#
+# * Coolify deploys THIS file only (Build Pack: Docker Compose, location: /compose.yaml).
+# * Locally, `podman compose up` additionally merges compose.override.yaml (dev tools,
+#   dev secrets, published ports). The override is never used by Coolify.
+#
+# Every secret is read from the environment and has NO usable default: if one is
+# missing, the affected service refuses to start (fail closed). In Coolify, set them
+# under "Environment Variables" (see galvani.env.example for the full list).
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+x-hardening: &hardening
+  restart: unless-stopped
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  logging: *logging
+
+x-app-env: &app-env
+  APP_ENV: prod
+  APP_DEBUG: "0"
+  APP_SECRET: ${APP_SECRET:-}
+  DEFAULT_URI: https://${APP_DOMAIN:-localhost}
+  TRUSTED_PROXIES: ${TRUSTED_PROXIES:-private_ranges}
+  DATABASE_URL: postgresql://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-}@database:5432/${POSTGRES_DB:-app}?serverVersion=18&charset=utf8
+  REDIS_URL: redis://${VALKEY_PASSWORD:-}@valkey:6379
+  MESSENGER_TRANSPORT_DSN: amqp://${RABBITMQ_USER:-app}:${RABBITMQ_PASSWORD:-}@rabbitmq:5672/%2f/messages
+  MAILER_DSN: ${MAILER_DSN:-}
+  # Mercure: hub runs inside the php service (FrankenPHP); one shared HS256 secret.
+  MERCURE_URL: http://php:8080/.well-known/mercure
+  MERCURE_PUBLIC_URL: https://${APP_DOMAIN:-localhost}/.well-known/mercure
+  MERCURE_JWT_SECRET: ${MERCURE_JWT_SECRET:-}
+  MERCURE_JWT_ISSUER: https://${APP_DOMAIN:-localhost}
+
+x-app: &app
+  <<: *hardening
+  build:
+    context: .
+    target: prod
+  tmpfs:
+    - /tmp:mode=1777,size=256m
+
+services:
+  php:
+    <<: *app
+    environment:
+      <<: *app-env
+      # Hub configuration (FrankenPHP's built-in Mercure)
+      MERCURE_PUBLISHER_JWT_KEY: ${MERCURE_JWT_SECRET:-}
+      MERCURE_SUBSCRIBER_JWT_KEY: ${MERCURE_JWT_SECRET:-}
+      MERCURE_TRUSTED_ISSUERS: https://${APP_DOMAIN:-localhost}
+      MERCURE_EXTRA_DIRECTIVES: ${MERCURE_EXTRA_DIRECTIVES:-}
+      FRANKENPHP_WORKER_CONFIG: ${FRANKENPHP_WORKER_CONFIG:-}
+      GALVANI_MIGRATE: ${GALVANI_MIGRATE:-1}
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+    # No published ports: Coolify's proxy reaches the container on the network.
+    # In Coolify, set the domain of this service to https://<APP_DOMAIN>:8080
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD", "galvani-healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+    depends_on:
+      database:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: ${PHP_MEM_LIMIT:-1536M}
+    networks:
+      - default
+      - backend
+
+  worker:
+    <<: *app
+    command: ["galvani-worker"]
+    environment:
+      <<: *app-env
+      GALVANI_REQUIRED_SECRETS: APP_SECRET
+      MESSENGER_TRANSPORTS: ${MESSENGER_TRANSPORTS:-async}
+      MESSENGER_TIME_LIMIT: ${MESSENGER_TIME_LIMIT:-3600}
+      MESSENGER_MEMORY_LIMIT: ${MESSENGER_MEMORY_LIMIT:-256M}
+    stop_grace_period: 30s
+    depends_on:
+      php:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: ${WORKER_MEM_LIMIT:-512M}
+    networks:
+      - default
+      - backend
+
+  database:
+    <<: *hardening
+    image: docker.io/library/postgres:18-alpine
+    # Run as the postgres user directly: no root entrypoint, no capabilities needed.
+    user: postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-app}
+      POSTGRES_USER: ${POSTGRES_USER:-app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+    command:
+      - postgres
+      - -c
+      - shared_buffers=${POSTGRES_SHARED_BUFFERS:-256MB}
+      - -c
+      - effective_cache_size=${POSTGRES_EFFECTIVE_CACHE_SIZE:-768MB}
+      - -c
+      - work_mem=${POSTGRES_WORK_MEM:-8MB}
+      - -c
+      - maintenance_work_mem=${POSTGRES_MAINTENANCE_WORK_MEM:-64MB}
+      - -c
+      - max_connections=${POSTGRES_MAX_CONNECTIONS:-100}
+      - -c
+      - password_encryption=scram-sha-256
+      - -c
+      - log_min_duration_statement=${POSTGRES_LOG_MIN_DURATION:-1000}
+    shm_size: 256m
+    stop_grace_period: 60s
+    volumes:
+      - database_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: ${POSTGRES_MEM_LIMIT:-1G}
+    networks:
+      - backend
+
+  valkey:
+    <<: *hardening
+    image: docker.io/valkey/valkey:9-alpine
+    user: valkey
+    environment:
+      VALKEY_PASSWORD: ${VALKEY_PASSWORD:-}
+      VALKEY_MAXMEMORY: ${VALKEY_MAXMEMORY:-256mb}
+      VALKEY_MAXMEMORY_POLICY: ${VALKEY_MAXMEMORY_POLICY:-allkeys-lru}
+      VALKEY_IO_THREADS: ${VALKEY_IO_THREADS:-1}
+    # The password goes into a 0600 config file in tmpfs instead of the command line.
+    # Admin/dangerous commands are disabled for the application user via ACL.
+    command:
+      - sh
+      - -ec
+      - |
+        [ -n "$${VALKEY_PASSWORD}" ] || { echo "FATAL: VALKEY_PASSWORD is not set" >&2; exit 1; }
+        [ "$${#VALKEY_PASSWORD}" -ge 32 ] || { echo "FATAL: VALKEY_PASSWORD must be >= 32 chars" >&2; exit 1; }
+        umask 077
+        printf 'user default on >%s ~* &* +@all -config -debug -module -monitor -shutdown -acl -replicaof -slaveof -sync -psync -failover -cluster -migrate\n' "$${VALKEY_PASSWORD}" > /tmp/valkey-acl.conf
+        exec valkey-server \
+          --aclfile /tmp/valkey-acl.conf \
+          --maxmemory "$${VALKEY_MAXMEMORY}" \
+          --maxmemory-policy "$${VALKEY_MAXMEMORY_POLICY}" \
+          --save 3600 1 300 100 \
+          --appendonly no \
+          --protected-mode yes \
+          --io-threads "$${VALKEY_IO_THREADS}"
+    tmpfs:
+      - /tmp:mode=1777,size=1m
+    volumes:
+      - valkey_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$${VALKEY_PASSWORD}\" valkey-cli --no-auth-warning ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: ${VALKEY_MEM_LIMIT:-384M}
+    networks:
+      - backend
+
+  rabbitmq:
+    <<: *hardening
+    # Pinned to a minor: RabbitMQ upgrades must go one minor at a time.
+    image: docker.io/library/rabbitmq:4.3-alpine
+    user: rabbitmq
+    hostname: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-app}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-}
+    command:
+      - sh
+      - -ec
+      - |
+        [ -n "$${RABBITMQ_DEFAULT_PASS}" ] || { echo "FATAL: RABBITMQ_PASSWORD is not set" >&2; exit 1; }
+        [ "$${#RABBITMQ_DEFAULT_PASS}" -ge 32 ] || { echo "FATAL: RABBITMQ_PASSWORD must be >= 32 chars" >&2; exit 1; }
+        exec docker-entrypoint.sh rabbitmq-server
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: ${RABBITMQ_MEM_LIMIT:-512M}
+    networks:
+      - backend
+
+networks:
+  default:
+  # Data services live on an internal network: no published ports, no egress.
+  backend:
+    internal: true
+
+volumes:
+  caddy_data:
+  caddy_config:
+  database_data:
+  valkey_data:
+  rabbitmq_data:

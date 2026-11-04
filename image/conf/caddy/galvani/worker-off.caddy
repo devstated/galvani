@@ -1,0 +1,2 @@
+# Imported when GALVANI_WORKER_MODE=off: classic request-per-boot mode.
+# Useful in dev on hosts where file watching doesn't work (Windows/macOS bind mounts).

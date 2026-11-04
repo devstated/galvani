@@ -1,0 +1,7 @@
+# Imported inside `php @frontController { ... }` when GALVANI_WORKER_MODE=on.
+# Symfony 8 (symfony/runtime) detects FrankenPHP worker mode automatically.
+# Tune with FRANKENPHP_WORKER_CONFIG, e.g. "num 8", "max_threads 32" or "watch" (dev).
+worker {
+	file /app/public/index.php
+	{$FRANKENPHP_WORKER_CONFIG}
+}

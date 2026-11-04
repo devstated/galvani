@@ -1,0 +1,25 @@
+#!/bin/sh
+# Symfony Messenger consumer, configured through env:
+#   MESSENGER_TRANSPORTS   space separated transports      (default: async)
+#                          e.g. "async scheduler_default" to also run the Scheduler
+#   MESSENGER_TIME_LIMIT   seconds before a graceful exit  (default: 3600)
+#   MESSENGER_MEMORY_LIMIT memory before a graceful exit   (default: 256M)
+# The container's restart policy brings the consumer back: this keeps memory leaks
+# and stale code in check.
+set -eu
+cd /app
+
+# A fresh app may not have Messenger yet: idle instead of crash-looping.
+if ! php bin/console list messenger --raw 2>/dev/null | grep -q '^messenger:consume'; then
+	echo "[galvani] symfony/messenger is not installed (or bin/console fails) - worker idle." >&2
+	echo "[galvani] Install it with: composer require symfony/messenger symfony/amqp-messenger" >&2
+	trap 'exit 0' TERM INT
+	while :; do sleep 3600 & wait $!; done
+fi
+
+# shellcheck disable=SC2086 # word splitting of the transport list is intended
+exec php bin/console messenger:consume ${MESSENGER_TRANSPORTS:-async} \
+	--time-limit="${MESSENGER_TIME_LIMIT:-3600}" \
+	--memory-limit="${MESSENGER_MEMORY_LIMIT:-256M}" \
+	--no-interaction \
+	"$@"

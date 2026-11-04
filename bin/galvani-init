@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# galvani-init — copy the Galvani stack template into a Symfony app repository.
+#
+# Usage:
+#   bin/galvani-init <app-dir> [--owner <github-owner>] [--tag <major>] [--force]
+#
+#   --owner  GitHub user/org that publishes ghcr.io/<owner>/galvani-php
+#            (default: derived from this repo's `origin` remote, else devstated)
+#   --tag    Base image tag the app follows (default: 1)
+#   --force  Overwrite existing Galvani files (a .galvani-bak copy is kept)
+#
+# Works in Git Bash (Windows), WSL, Linux and macOS. Never touches app code.
+set -euo pipefail
+
+GALVANI_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TEMPLATE_DIR="$GALVANI_DIR/template"
+FILES=(Dockerfile compose.yaml compose.override.yaml .dockerignore galvani.env.example)
+MARKER="Galvani"
+DEFAULT_OWNER="devstated"
+
+app_dir="" owner="" tag="1" force=0
+
+usage() { sed -n '2,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+info() { printf '\033[32m[galvani]\033[0m %s\n' "$*"; }
+warn() { printf '\033[33m[galvani]\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[31m[galvani]\033[0m %s\n' "$*" >&2; exit 1; }
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--owner) owner="${2:-}"; shift 2 ;;
+		--tag)   tag="${2:-}"; shift 2 ;;
+		--force) force=1; shift ;;
+		-h|--help) usage 0 ;;
+		-*) die "Unknown option: $1" ;;
+		*) [ -z "$app_dir" ] || die "Only one app directory allowed"; app_dir="$1"; shift ;;
+	esac
+done
+
+[ -n "$app_dir" ] || usage 1
+[ -d "$app_dir" ] || die "Directory not found: $app_dir"
+app_dir="$(cd "$app_dir" && pwd)"
+[ "$app_dir" != "$GALVANI_DIR" ] || die "Target must be an app repository, not galvani itself."
+
+if [ -z "$owner" ]; then
+	remote="$(git -C "$GALVANI_DIR" config --get remote.origin.url 2>/dev/null || true)"
+	owner="$(printf '%s' "$remote" | sed -nE 's#^(https://github\.com/|git@github\.com:)([^/]+)/.*#\2#p')"
+fi
+owner="${owner:-$DEFAULT_OWNER}"   # no GitHub remote (e.g. downloaded archive): upstream image
+printf '%s' "$owner" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9-]*$' || die "Invalid GitHub owner: $owner"
+owner_lc="$(printf '%s' "$owner" | tr '[:upper:]' '[:lower:]')"   # registry paths must be lowercase
+printf '%s' "$tag" | grep -Eq '^[0-9]+$' || die "--tag must be a major version number, e.g. 1"
+
+# 1. Flex-generated compose files (Doctrine/Mercure recipes) conflict with the stack.
+for f in compose.yaml compose.override.yaml docker-compose.yml docker-compose.override.yml; do
+	if [ -f "$app_dir/$f" ] && ! grep -q "$MARKER" "$app_dir/$f"; then
+		mv "$app_dir/$f" "$app_dir/$f.flex-bak"
+		warn "Moved existing $f -> $f.flex-bak (review and delete it)."
+	fi
+done
+
+# 2. Copy template files.
+for f in "${FILES[@]}"; do
+	src="$TEMPLATE_DIR/$f" dst="$app_dir/$f"
+	if [ -f "$dst" ]; then
+		if [ "$force" -eq 1 ]; then
+			cp "$dst" "$dst.galvani-bak"
+		else
+			warn "Skipping existing $f (use --force to overwrite)."
+			continue
+		fi
+	fi
+	sed -e "s#ghcr\.io/$DEFAULT_OWNER/galvani-php#ghcr.io/$owner_lc/galvani-php#g" -e "s#^ARG GALVANI_TAG=.*#ARG GALVANI_TAG=$tag#" "$src" > "$dst"
+	info "Wrote $f"
+done
+
+# 3. Build-time placeholders in the committed .env. Symfony needs every env var it
+#    references to exist when the cache is built inside the image; the real values
+#    are injected at runtime by compose/Coolify. Only missing keys are added.
+if [ -f "$app_dir/.env" ]; then
+	placeholders=(
+		"REDIS_URL=redis://valkey:6379"
+		"MESSENGER_TRANSPORT_DSN=amqp://app:app@rabbitmq:5672/%2f/messages"
+		"DATABASE_URL=postgresql://app:app@database:5432/app?serverVersion=18&charset=utf8"
+		"MAILER_DSN=null://null"
+		"TRUSTED_PROXIES=private_ranges"
+	)
+	block=""
+	for kv in "${placeholders[@]}"; do
+		grep -q "^${kv%%=*}=" "$app_dir/.env" || block+="$kv"$'\n'
+	done
+	if [ -n "$block" ]; then
+		printf '\n###> galvani ###\n# Placeholders only (no secrets). Runtime values come from compose.yaml / Coolify.\n%s###< galvani ###\n' "$block" >> "$app_dir/.env"
+		info "Added missing placeholders to .env"
+	fi
+fi
+
+# 4. Tell Symfony Flex to stop generating Docker files in this app.
+if [ -f "$app_dir/composer.json" ]; then
+	set_flex() { (cd "$app_dir" && "$@" config --json extra.symfony.docker false); }
+	if command -v composer >/dev/null 2>&1; then
+		set_flex composer && info "Set extra.symfony.docker=false in composer.json"
+	elif command -v podman >/dev/null 2>&1 || command -v docker >/dev/null 2>&1; then
+		engine="$(command -v podman >/dev/null 2>&1 && echo podman || echo docker)"
+		# Git Bash: the Windows podman/docker binary needs a Windows path (C:/...).
+		mount_src="$( (cd "$app_dir" && pwd -W) 2>/dev/null || printf '%s' "$app_dir")"
+		if MSYS_NO_PATHCONV=1 "$engine" run --rm -v "$mount_src:/app" -w /app docker.io/library/composer:2 \
+			config --json extra.symfony.docker false; then
+			info "Set extra.symfony.docker=false in composer.json"
+		else
+			warn "Could not update composer.json; run in the app: composer config --json extra.symfony.docker false"
+		fi
+	else
+		warn "Run in the app: composer config --json extra.symfony.docker false"
+	fi
+fi
+
+cat <<EOF
+
+Done. Next steps in $app_dir:
+
+  podman compose up -d --build          # dev stack: http://localhost:8000
+  podman compose logs -f php
+
+  # Composer with the app's exact PHP:
+  podman compose run --rm composer require symfony/orm-pack
+
+Production: see $GALVANI_DIR/docs/coolify.md
+EOF

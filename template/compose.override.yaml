@@ -1,0 +1,178 @@
+# Galvani stack — LOCAL DEVELOPMENT override.
+#
+# Merged automatically by `podman compose` / `docker compose` on a developer machine.
+# NEVER used in production (Coolify only reads compose.yaml).
+#
+# All values below are throw-away dev credentials. They are deliberately short or
+# marked "dev-only" so the prod entrypoint checks would reject them.
+#
+# URLs (ports bound to 127.0.0.1 only):
+#   App ............ http://localhost:8000
+#   Mailpit ........ http://localhost:8025
+#   Adminer ........ http://localhost:8081   (server: database, user/pass/db: app)
+#   RabbitMQ UI .... http://localhost:15672  (app / app)
+#   PostgreSQL ..... localhost:5432          (for IDE tools)
+
+x-dev-env: &dev-env
+  APP_ENV: dev
+  APP_DEBUG: "1"
+  APP_SECRET: dev-only-app-secret-not-for-production
+  DEFAULT_URI: http://localhost:${HTTP_PORT:-8000}
+  TRUSTED_PROXIES: private_ranges
+  DATABASE_URL: postgresql://app:app@database:5432/app?serverVersion=18&charset=utf8
+  REDIS_URL: redis://dev-only-valkey-password-not-for-production@valkey:6379
+  MESSENGER_TRANSPORT_DSN: amqp://app:app@rabbitmq:5672/%2f/messages
+  MAILER_DSN: smtp://mailpit:1025
+  MERCURE_URL: http://php:8080/.well-known/mercure
+  MERCURE_PUBLIC_URL: http://localhost:${HTTP_PORT:-8000}/.well-known/mercure
+  MERCURE_JWT_SECRET: dev-only-mercure-secret-not-for-production
+  MERCURE_JWT_ISSUER: http://localhost:${HTTP_PORT:-8000}
+  XDEBUG_MODE: ${XDEBUG_MODE:-off}
+
+x-dev-app: &dev-app
+  build:
+    context: .
+    target: dev
+  # Rootless Podman: container root == the host user (correct file ownership).
+  # Rootful Docker on Linux: set DEV_UID/DEV_GID to `id -u` / `id -g`.
+  user: "${DEV_UID:-0}:${DEV_GID:-0}"
+  # Dev only: bind mounts from Windows/macOS hosts (9p/virtiofs) are owned by a
+  # different UID, so Composer/unzip need to chmod/chown files they don't own.
+  # Production keeps cap_drop: [ALL] with nothing added back.
+  cap_add:
+    - CHOWN
+    - DAC_OVERRIDE
+    - FOWNER
+    - FSETID
+  volumes:
+    # :z relabels for SELinux hosts (Fedora/RHEL); harmless elsewhere.
+    - ./:/app:z
+    # var/ in a named volume: much faster than bind mounts on Windows/macOS.
+    - app_var:/app/var
+    - composer_cache:/composer-cache
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+
+services:
+  php:
+    <<: *dev-app
+    environment:
+      <<: *dev-env
+      MERCURE_PUBLISHER_JWT_KEY: dev-only-mercure-secret-not-for-production
+      MERCURE_SUBSCRIBER_JWT_KEY: dev-only-mercure-secret-not-for-production
+      MERCURE_TRUSTED_ISSUERS: http://localhost:${HTTP_PORT:-8000}
+      # Dev: allow anonymous subscribers, subscription API, plain-HTTP cookie name.
+      MERCURE_EXTRA_DIRECTIVES: |
+        anonymous
+        subscriptions
+        cookie_name mercureAuthorization
+      # Worker mode in dev is OFF by default: file watching does not work through
+      # Windows/macOS bind mounts. On native Linux use: GALVANI_WORKER_MODE=on
+      GALVANI_WORKER_MODE: ${GALVANI_WORKER_MODE:-off}
+      FRANKENPHP_WORKER_CONFIG: watch
+      GALVANI_CADDY_ADMIN: "127.0.0.1:2019"
+      GALVANI_COMPOSER_INSTALL: "1"
+      GALVANI_MIGRATE: ${GALVANI_MIGRATE:-0}
+    volumes:
+      - ./:/app:z
+      - app_var:/app/var
+      - composer_cache:/composer-cache
+      - caddy_data:/data
+      - caddy_config:/config
+    ports:
+      - "127.0.0.1:${HTTP_PORT:-8000}:8080"
+    healthcheck:
+      # First start runs `composer install`, which is slow on Windows/macOS bind mounts.
+      start_period: 600s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  worker:
+    <<: *dev-app
+    environment:
+      <<: *dev-env
+      GALVANI_REQUIRED_SECRETS: ""
+      MESSENGER_TRANSPORTS: ${MESSENGER_TRANSPORTS:-async}
+      # Short lifetime in dev so code changes are picked up quickly.
+      MESSENGER_TIME_LIMIT: "60"
+    # Until symfony/messenger is installed the worker just idles (see its logs).
+
+  database:
+    environment:
+      POSTGRES_DB: app
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    networks:
+      - default
+      - backend
+
+  valkey:
+    environment:
+      VALKEY_PASSWORD: dev-only-valkey-password-not-for-production
+
+  rabbitmq:
+    # Management UI only in dev.
+    image: docker.io/library/rabbitmq:4.3-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: app
+      RABBITMQ_DEFAULT_PASS: app
+    # Dev: skip the password-length check of the prod command.
+    command: ["docker-entrypoint.sh", "rabbitmq-server"]
+    ports:
+      - "127.0.0.1:${RABBITMQ_UI_PORT:-15672}:15672"
+    networks:
+      - default
+      - backend
+
+  mailpit:
+    image: docker.io/axllent/mailpit:v1
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: "1"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "1"
+      MP_MAX_MESSAGES: "5000"
+    ports:
+      - "127.0.0.1:${MAILPIT_UI_PORT:-8025}:8025"
+
+  adminer:
+    image: docker.io/library/adminer:5
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    environment:
+      ADMINER_DEFAULT_SERVER: database
+      ADMINER_DESIGN: pepa-linha-dark
+    ports:
+      - "127.0.0.1:${ADMINER_PORT:-8081}:8080"
+    depends_on:
+      - database
+    networks:
+      - default
+      - backend
+
+  # One-off Composer runs with the exact PHP version/extensions of the app:
+  #   podman compose run --rm composer require symfony/orm-pack
+  composer:
+    <<: *dev-app
+    profiles: ["tools"]
+    entrypoint: ["composer"]
+    command: ["--version"]
+    environment:
+      APP_ENV: dev
+      GALVANI_REQUIRED_SECRETS: ""
+    networks:
+      - default
+
+volumes:
+  app_var:
+  composer_cache:

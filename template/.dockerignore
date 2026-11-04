@@ -1,0 +1,29 @@
+# Keep the production build context small and free of secrets.
+.git
+.github
+.idea
+.vscode
+**/*.log
+**/.DS_Store
+
+# Local env files may contain secrets — never bake them into an image
+.env.local
+.env.*.local
+.env.local.php
+
+# Rebuilt inside the image
+var/
+vendor/
+node_modules/
+public/assets/
+public/bundles/
+
+# Container tooling and tests are not part of the runtime
+compose*.yaml
+compose*.yml
+Dockerfile
+.dockerignore
+galvani.env.example
+tests/
+phpunit.xml*
+.phpunit.cache/
