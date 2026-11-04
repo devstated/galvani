@@ -116,7 +116,7 @@ services:
 
   rabbitmq:
     # Management UI only in dev.
-    image: docker.io/library/rabbitmq:4.3-management-alpine
+    image: docker.io/library/rabbitmq:4.4-management-alpine
     environment:
       RABBITMQ_DEFAULT_USER: app
       RABBITMQ_DEFAULT_PASS: app

@@ -197,7 +197,7 @@ services:
   rabbitmq:
     <<: *hardening
     # Pinned to a minor: RabbitMQ upgrades must go one minor at a time.
-    image: docker.io/library/rabbitmq:4.3-alpine
+    image: docker.io/library/rabbitmq:4.4-alpine
     user: rabbitmq
     hostname: rabbitmq
     environment:
