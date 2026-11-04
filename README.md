@@ -14,6 +14,7 @@ pulls in the stack with one command.
 | `php` | `ghcr.io/devstated/galvani-php` (FrankenPHP 1.x, PHP 8.5) | ✅ | ✅ | Web server in **worker mode** + built-in **Mercure** hub |
 | `worker` | same image | ✅ | ✅ | Symfony Messenger consumer |
 | `composer` | same image (`-dev`) | ✅ | — | Composer with the app's exact PHP + extensions |
+| `tailwind` | same image (`-dev`) | ✅ | — | Tailwind CSS watcher (idles until `symfonycasts/tailwind-bundle` is installed) |
 | `database` | `postgres:18-alpine` | ✅ | ✅ | PostgreSQL |
 | `valkey` | `valkey/valkey:9-alpine` | ✅ | ✅ | Cache (and optionally sessions/locks) |
 | `rabbitmq` | `rabbitmq:4.3-alpine` (`-management` in dev) | ✅ | ✅ | Messenger broker |
@@ -55,6 +56,10 @@ delegates to `docker-compose` or `podman-compose`; Podman Desktop can install on
 *Settings → Resources → Compose*. With Docker, `docker compose` works as is: replace
 `podman` with `docker` in the commands below.
 
+**On Windows**, read [docs/windows.md](docs/windows.md) first: keeping the code inside WSL
+makes pages much faster and enables automatic reloading, and PowerShell needs slightly
+different commands than the bash examples below.
+
 ```bash
 # 0. New app? (uses the Galvani dev image, so no local PHP is needed)
 podman run --rm -v "$PWD:/w" -w /w ghcr.io/devstated/galvani-php:1-dev \
@@ -91,10 +96,18 @@ podman compose run --rm composer require symfony/orm-pack   # Composer
 podman compose exec php bin/console doctrine:migrations:migrate
 podman compose restart worker                                # pick up handler changes
 XDEBUG_MODE=debug podman compose up -d php                  # Xdebug (port 9003)
-GALVANI_WORKER_MODE=on podman compose up -d php             # test worker mode locally
+podman compose logs php | grep "worker mode"                 # which dev mode is active
 ```
 
+**Dev modes:** on a Linux filesystem (Linux host, WSL home folder), the dev stack runs in
+worker mode, restarts workers when PHP code changes and updates the browser through
+FrankenPHP's hot reload. On folders shared from Windows/macOS, where file-change events
+don't arrive, it falls back to classic mode. Override with `GALVANI_WORKER_MODE=on|off`
+and `GALVANI_HOT_RELOAD=on|off`.
+
 Next, connect the app to the services: [docs/symfony-app.md](docs/symfony-app.md).
+Tailwind CSS and daisyUI work without Node; see the same guide.
+Something not working? See [docs/troubleshooting.md](docs/troubleshooting.md).
 
 ## Production
 
@@ -148,7 +161,10 @@ CI builds `linux/amd64` only. For ARM servers, see the comment in
 - [docs/decisions.md](docs/decisions.md): architecture decisions and their reasoning
 - [docs/coolify.md](docs/coolify.md): production deployment and server hardening
 - [docs/updating.md](docs/updating.md): how base image and app updates flow
-- [docs/symfony-app.md](docs/symfony-app.md): configuration an app needs to use the stack
+- [docs/symfony-app.md](docs/symfony-app.md): configuration an app needs to use the stack,
+  hot reload, Tailwind CSS and daisyUI
+- [docs/windows.md](docs/windows.md): developing on Windows (WSL or Podman Desktop)
+- [docs/troubleshooting.md](docs/troubleshooting.md): common errors and their fixes
 - [SECURITY.md](SECURITY.md): security model and vulnerability reporting
 
 ## Contributing

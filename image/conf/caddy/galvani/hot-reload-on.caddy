@@ -1,0 +1,15 @@
+# Imported inside `php @frontController { ... }` when GALVANI_HOT_RELOAD=on (dev only).
+# On a change, FrankenPHP publishes the changed files to the built-in Mercure hub and the
+# browser (frankenphp-hot-reload script, see docs/symfony-app.md) updates the page.
+# var/ and vendor/ are not watched: Symfony writes its cache there on every rebuild.
+# Add patterns with GALVANI_HOT_RELOAD_CONFIG, e.g. "watch /app/lib/**/*.php".
+hot_reload {
+	watch /app/src/**/*.php
+	watch /app/config/**/*.{php,yaml,yml}
+	watch /app/templates/**/*.{twig,html}
+	watch /app/translations/**/*
+	watch /app/assets/**/*.{css,js,mjs,ts,json,svg,png,jpg,jpeg,gif,webp}
+	# Output of symfonycasts/tailwind-bundle (tailwind:build --watch)
+	watch /app/var/tailwind/*.css
+	{$GALVANI_HOT_RELOAD_CONFIG}
+}

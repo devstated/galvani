@@ -40,7 +40,10 @@ With `APP_ENV=prod` the entrypoint refuses to start when:
 
 - a required secret (`APP_SECRET`, Mercure keys) is missing, shorter than 32 characters,
   or contains a placeholder (`ChangeMe`, `dev-only`, …),
-- `APP_DEBUG` is enabled.
+- `APP_DEBUG` is enabled,
+- `GALVANI_HOT_RELOAD` is enabled (a development feature that publishes file changes),
+- `GALVANI_WORKER_MODE` or `GALVANI_HOT_RELOAD` has a value other than `on`, `off` or `auto`
+  (checked in every environment).
 
 Valkey and RabbitMQ refuse to start without a password of at least 32 characters.
 PostgreSQL refuses to initialise without a password.
@@ -71,3 +74,5 @@ PostgreSQL refuses to initialise without a password.
 - Dev credentials are intentionally invalid for prod.
 - The dev app container adds back `CHOWN`, `DAC_OVERRIDE`, `FOWNER` and `FSETID`. These are
   needed for bind mounts from Windows/macOS hosts and are not present in prod.
+- Hot reload publishes the names of changed files over Mercure, which allows anonymous
+  subscribers in dev only. Both are refused or off in prod.

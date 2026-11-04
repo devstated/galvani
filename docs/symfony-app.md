@@ -104,7 +104,66 @@ only keys with a TTL are evicted.
 FrankenPHP keeps the kernel in memory between requests:
 
 - Don't keep request data in service properties, or implement `ResetInterface`.
-- Check locally with `GALVANI_WORKER_MODE=on podman compose up -d php`.
+- On a Linux filesystem, dev runs in worker mode automatically. On a Windows/macOS folder,
+  check worker-mode behaviour with `GALVANI_WORKER_MODE=on podman compose up -d php`.
+
+## Hot reload (dev)
+
+On a Linux filesystem, dev enables FrankenPHP's hot reload: when a watched file changes,
+the browser updates the page without a manual reload. It is never active in production.
+Add this to the `<head>` of the base layout (`templates/base.html.twig`):
+
+```twig
+{% set hot_reload_url = app.request.server.get('FRANKENPHP_HOT_RELOAD') %}
+{% if hot_reload_url %}
+    <meta name="frankenphp-hot-reload:url" content="{{ hot_reload_url }}">
+    <script src="https://cdn.jsdelivr.net/npm/idiomorph/dist/idiomorph.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/frankenphp-hot-reload/+esm" type="module"></script>
+{% endif %}
+```
+
+The variable only exists while hot reload is on, so the block renders nothing in
+production. Pin the two packages to a version (`.../npm/frankenphp-hot-reload@x.y.z/+esm`)
+once the setup works. With Idiomorph, the page is morphed in place; elements that must
+survive an update (the Symfony web debug toolbar is the usual example) can be marked with
+`data-frankenphp-hot-reload-preserve`. Without Idiomorph, the page reloads fully.
+
+Watched by default: `src/`, `config/`, `templates/`, `translations/`, `assets/` and the
+Tailwind output in `var/tailwind/`. Add more with `GALVANI_HOT_RELOAD_CONFIG`, e.g.
+`watch /app/lib/**/*.php`.
+
+## Tailwind CSS and daisyUI (no Node)
+
+```bash
+podman compose run --rm composer require symfonycasts/tailwind-bundle
+podman compose exec php bin/console tailwind:init
+podman compose exec php bin/console cache:clear
+podman compose restart tailwind
+```
+
+The `tailwind` dev service now rebuilds the CSS on every change (`podman compose logs -f
+tailwind`); the prod image build runs `tailwind:build --minify` automatically.
+
+daisyUI 5 ships plugin files for the standalone Tailwind binary. Download them next to
+the CSS file, pinned to a release, and commit them:
+
+```bash
+cd assets/styles
+curl -fsSLO https://github.com/saadeghi/daisyui/releases/download/v5.x.y/daisyui.mjs
+curl -fsSLO https://github.com/saadeghi/daisyui/releases/download/v5.x.y/daisyui-theme.mjs
+```
+
+```css
+/* assets/styles/app.css */
+@import "tailwindcss";
+@plugin "./daisyui.mjs";
+```
+
+Replace `v5.x.y` with the current release from the daisyUI releases page. To update
+daisyUI, download the files of the new release.
+
+A JavaScript bundler (Rsbuild, Vite) is only worth adding for substantial JavaScript;
+see [ADR-8](decisions.md#adr-8-frontend-assets-without-node-by-default).
 
 ## Extra PHP extensions
 

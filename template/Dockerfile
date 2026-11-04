@@ -34,6 +34,8 @@ RUN --mount=type=cache,target=/composer-cache <<-EOF
 	composer dump-autoload --classmap-authoritative --no-dev
 	composer run-script --no-dev post-install-cmd
 	if php bin/console list --raw | grep -q '^importmap:install'; then php bin/console importmap:install; fi
+	# symfonycasts/tailwind-bundle: build the CSS before AssetMapper copies it to public/
+	if php bin/console list --raw | grep -q '^tailwind:build'; then php bin/console tailwind:build --minify; fi
 	if php bin/console list --raw | grep -q '^asset-map:compile'; then php bin/console asset-map:compile; fi
 	rm -rf var/
 EOF

@@ -94,23 +94,31 @@ if [ -f "$app_dir/.env" ]; then
 	fi
 fi
 
-# 4. Tell Symfony Flex to stop generating Docker files in this app.
+# 4. Tell Symfony Flex to stop generating Docker files in this app. Uses host Composer
+#    if present, otherwise the Galvani dev image (the app build needs it anyway).
+todo=()
 if [ -f "$app_dir/composer.json" ]; then
-	set_flex() { (cd "$app_dir" && "$@" config --json extra.symfony.docker false); }
+	flex_args=(config --json extra.symfony.docker false)
+	dev_image="ghcr.io/$owner_lc/galvani-php:$tag-dev"
 	if command -v composer >/dev/null 2>&1; then
-		set_flex composer && info "Set extra.symfony.docker=false in composer.json"
+		if (cd "$app_dir" && composer "${flex_args[@]}"); then
+			info "Set extra.symfony.docker=false in composer.json"
+		else
+			todo+=("In $app_dir run: composer ${flex_args[*]}")
+		fi
 	elif command -v podman >/dev/null 2>&1 || command -v docker >/dev/null 2>&1; then
 		engine="$(command -v podman >/dev/null 2>&1 && echo podman || echo docker)"
 		# Git Bash: the Windows podman/docker binary needs a Windows path (C:/...).
 		mount_src="$( (cd "$app_dir" && pwd -W) 2>/dev/null || printf '%s' "$app_dir")"
-		if MSYS_NO_PATHCONV=1 "$engine" run --rm -v "$mount_src:/app" -w /app docker.io/library/composer:2 \
-			config --json extra.symfony.docker false; then
+		info "Running Composer in $dev_image ..."
+		if MSYS_NO_PATHCONV=1 "$engine" run --rm -v "$mount_src:/app" -w /app "$dev_image" composer "${flex_args[@]}"; then
 			info "Set extra.symfony.docker=false in composer.json"
 		else
-			warn "Could not update composer.json; run in the app: composer config --json extra.symfony.docker false"
+			todo+=("Composer could not run in $dev_image (is $engine running?). Once it works, run in the app:"
+				"  $engine compose run --rm composer ${flex_args[*]}")
 		fi
 	else
-		warn "Run in the app: composer config --json extra.symfony.docker false"
+		todo+=("No Composer, Podman or Docker found. Later, in the app, run: composer ${flex_args[*]}")
 	fi
 fi
 
@@ -126,3 +134,10 @@ Done. Next steps in $app_dir:
 
 Production: see $GALVANI_DIR/docs/coolify.md
 EOF
+
+if [ "${#todo[@]}" -gt 0 ]; then
+	printf '\n\033[33m[galvani] ACTION NEEDED\033[0m - one step could not be done automatically:\n' >&2
+	printf '  %s\n' "${todo[@]}" >&2
+	printf '  Until then, Symfony recipes offer to add their own Docker files: answer "x" (never).\n' >&2
+	exit 2
+fi

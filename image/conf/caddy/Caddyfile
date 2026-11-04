@@ -5,10 +5,13 @@
 #     container (Coolify/Traefik in production). No ACME, no privileged ports, no root.
 #   * Caddy admin API disabled by default (set GALVANI_CADDY_ADMIN=127.0.0.1:2019 to enable).
 #   * Health endpoint on 127.0.0.1:2020 (loopback only, never routed by the proxy).
-#   * Worker mode toggled with GALVANI_WORKER_MODE=on|off.
+#   * Worker mode toggled with GALVANI_WORKER_MODE=on|off|auto.
+#   * Browser hot reload (dev only) toggled with GALVANI_HOT_RELOAD=on|off|auto.
+#     `auto` is resolved by docker-entrypoint; hot reload is refused in prod.
 #
 # Environment knobs (parse-time, {$VAR}):
-#   GALVANI_HTTP_PORT, GALVANI_WORKER_MODE, GALVANI_TRUSTED_PROXIES, GALVANI_MAX_BODY_SIZE,
+#   GALVANI_HTTP_PORT, GALVANI_WORKER_MODE, GALVANI_HOT_RELOAD, GALVANI_HOT_RELOAD_CONFIG,
+#   GALVANI_TRUSTED_PROXIES, GALVANI_MAX_BODY_SIZE,
 #   GALVANI_CADDY_ADMIN, GALVANI_HSTS, CADDY_GLOBAL_OPTIONS, CADDY_EXTRA_CONFIG,
 #   CADDY_SERVER_EXTRA_DIRECTIVES, FRANKENPHP_CONFIG, FRANKENPHP_WORKER_CONFIG,
 #   MERCURE_TRUSTED_ISSUERS, MERCURE_EXTRA_DIRECTIVES
@@ -115,6 +118,7 @@ http://127.0.0.1:2020 {
 	@frontController path /index.php
 	php @frontController {
 		import /etc/frankenphp/galvani/worker-{$GALVANI_WORKER_MODE:on}.caddy
+		import /etc/frankenphp/galvani/hot-reload-{$GALVANI_HOT_RELOAD:off}.caddy
 	}
 
 	# Static files only; never serve PHP sources or server config files.

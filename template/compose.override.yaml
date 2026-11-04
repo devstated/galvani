@@ -66,10 +66,20 @@ services:
         anonymous
         subscriptions
         cookie_name mercureAuthorization
-      # Worker mode in dev is OFF by default: file watching does not work through
-      # Windows/macOS bind mounts. On native Linux use: GALVANI_WORKER_MODE=on
-      GALVANI_WORKER_MODE: ${GALVANI_WORKER_MODE:-off}
-      FRANKENPHP_WORKER_CONFIG: watch
+      # `auto`: worker mode + file watching + browser hot reload when the code sits on a
+      # Linux filesystem (Linux host, WSL home folder); classic mode without hot reload
+      # on Windows/macOS host folders, where file-change events never arrive.
+      # Force with GALVANI_WORKER_MODE=on|off and GALVANI_HOT_RELOAD=on|off.
+      GALVANI_WORKER_MODE: ${GALVANI_WORKER_MODE:-auto}
+      GALVANI_HOT_RELOAD: ${GALVANI_HOT_RELOAD:-auto}
+      # Restart the workers when PHP code or configuration changes (templates reload
+      # on their own). var/ and vendor/ are deliberately not watched.
+      FRANKENPHP_WORKER_CONFIG: |
+        watch /app/src/**/*.php
+        watch /app/config/**/*.{php,yaml,yml}
+        watch /app/translations/**/*
+        watch /app/.env*
+        watch /app/composer.lock
       GALVANI_CADDY_ADMIN: "127.0.0.1:2019"
       GALVANI_COMPOSER_INSTALL: "1"
       GALVANI_MIGRATE: ${GALVANI_MIGRATE:-0}
@@ -98,6 +108,45 @@ services:
       # Short lifetime in dev so code changes are picked up quickly.
       MESSENGER_TIME_LIMIT: "60"
     # Until symfony/messenger is installed the worker just idles (see its logs).
+
+  # Rebuilds the Tailwind CSS on every change (symfonycasts/tailwind-bundle). Idles
+  # until the bundle is installed. Watching needs a Linux filesystem, like hot reload.
+  tailwind:
+    <<: *dev-app
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    environment:
+      <<: *dev-env
+      GALVANI_REQUIRED_SECRETS: ""
+    command:
+      - sh
+      - -c
+      - |
+        if php bin/console list --raw 2>/dev/null | grep -q '^tailwind:build'; then
+          if php bin/console tailwind:build; then
+            exec php bin/console tailwind:build --watch
+          fi
+          echo '[galvani] tailwind:build failed. Run tailwind:init and cache:clear first. If the binary'
+          echo '[galvani] download was interrupted: podman compose exec php rm -rf var/tailwind'
+          echo '[galvani] Retrying in 30 s.'
+          sleep 30
+          exit 1
+        fi
+        echo '[galvani] symfonycasts/tailwind-bundle is not installed; the tailwind service idles.'
+        trap 'exit 0' TERM INT
+        while :; do sleep 3600 & wait $$!; done
+    depends_on:
+      php:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    networks:
+      - default
 
   database:
     environment:

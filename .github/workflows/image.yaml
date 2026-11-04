@@ -117,9 +117,15 @@ jobs:
           ENVS=(-e "APP_SECRET=$S" -e "MERCURE_PUBLISHER_JWT_KEY=$S" -e "MERCURE_SUBSCRIBER_JWT_KEY=$S")
           HARDEN=(--security-opt no-new-privileges:true --cap-drop ALL --read-only --tmpfs /tmp --tmpfs /data:mode=1777 --tmpfs /config:mode=1777)
 
-          echo "::group::Caddyfile is valid (worker on/off)"
-          docker run --rm "${ENVS[@]}" galvani-php:test frankenphp validate --config /etc/frankenphp/Caddyfile --adapter caddyfile
-          docker run --rm "${ENVS[@]}" -e GALVANI_WORKER_MODE=off galvani-php:test frankenphp validate --config /etc/frankenphp/Caddyfile --adapter caddyfile
+          echo "::group::Caddyfile is valid (worker on/off, hot reload on/off)"
+          for w in on off; do for h in on off; do
+            docker run --rm "${ENVS[@]}" -e APP_ENV=dev -e GALVANI_WORKER_MODE=$w -e GALVANI_HOT_RELOAD=$h \
+              galvani-php:test frankenphp validate --config /etc/frankenphp/Caddyfile --adapter caddyfile
+          done; done
+          echo "::endgroup::"
+
+          echo "::group::Invalid mode values are refused"
+          if docker run --rm "${ENVS[@]}" -e GALVANI_WORKER_MODE=../x galvani-php:test; then echo "accepted an invalid mode!"; exit 1; fi
           echo "::endgroup::"
 
           echo "::group::Server starts with zero capabilities and becomes healthy"
@@ -136,6 +142,9 @@ jobs:
           if [ "${{ matrix.variant }}" = "prod" ]; then
             echo "::group::Prod refuses to start without secrets"
             if docker run --rm galvani-php:test; then echo "started without secrets!"; exit 1; fi
+            echo "::endgroup::"
+            echo "::group::Prod refuses hot reload"
+            if docker run --rm "${ENVS[@]}" -e GALVANI_HOT_RELOAD=on galvani-php:test; then echo "started with hot reload!"; exit 1; fi
             echo "::endgroup::"
             echo "::group::Prod runs as non-root"
             test "$(docker run --rm --entrypoint id galvani-php:test -u)" = "33"

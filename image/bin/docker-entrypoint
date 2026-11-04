@@ -2,9 +2,10 @@
 # Galvani entrypoint.
 #
 # Responsibilities (all opt-in via env, all no-ops for non-app commands):
-#   1. Refuse to start in prod with missing/weak/placeholder secrets  (GALVANI_REQUIRED_SECRETS)
-#   2. Install vendors on first dev start                             (GALVANI_COMPOSER_INSTALL=1)
-#   3. Wait for the database and run Doctrine migrations              (GALVANI_MIGRATE=1)
+#   1. Resolve worker mode / hot reload (on|off|auto)                 (GALVANI_WORKER_MODE, GALVANI_HOT_RELOAD)
+#   2. Refuse to start in prod with missing/weak/placeholder secrets  (GALVANI_REQUIRED_SECRETS)
+#   3. Install vendors on first dev start                             (GALVANI_COMPOSER_INSTALL=1)
+#   4. Wait for the database and run Doctrine migrations              (GALVANI_MIGRATE=1)
 set -eu
 
 log() { printf '[galvani] %s\n' "$*" >&2; }
@@ -20,6 +21,54 @@ is_app_command() {
 		frankenphp | php | bin/console | galvani-worker) return 0 ;;
 		*) return 1 ;;
 	esac
+}
+
+# File-change events (inotify) only arrive on Linux filesystems. Host folders shared
+# into a VM (Windows: 9p, macOS: virtiofs, network shares, FUSE) never deliver them,
+# so file watching cannot work there. Unknown types count as "no events".
+fs_type() { stat -f -c %T "$1" 2>/dev/null || echo unknown; }
+fs_has_events() {
+	case "$(fs_type "$1")" in
+		ext2/ext3 | ext4 | btrfs | xfs | overlayfs | tmpfs | zfs | f2fs) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+# Values end up in Caddyfile import paths: allow only known values.
+resolve_modes() {
+	is_prod=0
+	[ "${APP_ENV:-prod}" = "prod" ] && is_prod=1
+
+	GALVANI_WORKER_MODE="${GALVANI_WORKER_MODE:-on}"
+	case "$GALVANI_WORKER_MODE" in
+		on | off) ;;
+		auto)
+			if [ "$is_prod" = 1 ] || fs_has_events /app; then
+				GALVANI_WORKER_MODE=on
+			else
+				GALVANI_WORKER_MODE=off
+			fi
+			;;
+		*) die "GALVANI_WORKER_MODE must be on, off or auto (got '$GALVANI_WORKER_MODE')." ;;
+	esac
+
+	GALVANI_HOT_RELOAD="${GALVANI_HOT_RELOAD:-off}"
+	case "$GALVANI_HOT_RELOAD" in
+		on | off) ;;
+		auto)
+			if [ "$is_prod" = 0 ] && fs_has_events /app; then
+				GALVANI_HOT_RELOAD=on
+			else
+				GALVANI_HOT_RELOAD=off
+			fi
+			;;
+		*) die "GALVANI_HOT_RELOAD must be on, off or auto (got '$GALVANI_HOT_RELOAD')." ;;
+	esac
+	if [ "$is_prod" = 1 ] && [ "$GALVANI_HOT_RELOAD" = on ]; then
+		die "GALVANI_HOT_RELOAD must not be enabled when APP_ENV=prod."
+	fi
+
+	export GALVANI_WORKER_MODE GALVANI_HOT_RELOAD
 }
 
 check_secrets() {
@@ -81,7 +130,11 @@ wait_for_database_and_migrate() {
 }
 
 if is_app_command "$1"; then
+	resolve_modes
 	check_secrets
+	if [ "$1" = frankenphp ] && [ "${2:-}" = run ]; then
+		log "worker mode: $GALVANI_WORKER_MODE, hot reload: $GALVANI_HOT_RELOAD (/app filesystem: $(fs_type /app))"
+	fi
 	if [ -f /app/composer.json ]; then
 		cd /app
 		composer_install

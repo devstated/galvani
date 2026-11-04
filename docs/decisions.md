@@ -111,20 +111,32 @@ state, so it runs with `cap_drop: [ALL]`. `trusted_proxies` in Caddy and `TRUSTE
 in Symfony are set to private ranges, so client IPs, `https` detection and the Mercure
 token audience are correct behind the proxy.
 
-## ADR-6: Worker mode on in prod, off by default in dev
+## ADR-6: Worker mode and hot reload chosen by filesystem in dev
 
 **Context:** worker mode keeps the Symfony kernel in memory between requests, which
 greatly increases throughput. Code changes then require a worker restart. FrankenPHP's
-`watch` option restarts workers automatically, but relies on inotify, which does not work
-through Windows/macOS bind mounts (Podman machine and Docker Desktop use 9p/virtiofs).
+`watch` option restarts workers on file changes, and its `hot_reload` option updates the
+browser. Both rely on Linux file-change events (inotify). Folders shared from a Windows or
+macOS host into the container VM (9p, virtiofs) never deliver these events, and every file
+access through them is slow: a Symfony dev request measured ~3 s on a Windows folder.
 
-**Decision:** worker mode is on in production. Dev defaults to classic mode
-(`GALVANI_WORKER_MODE=off`).
+**Decision:**
 
-**Consequences:** every code change is visible immediately in dev on all host systems.
-Behaviour that only appears in worker mode (state leaking between requests) is tested by
-running dev with `GALVANI_WORKER_MODE=on`, which is also the recommended setting on native
-Linux hosts.
+- Production: worker mode on, hot reload always off. The entrypoint refuses
+  `GALVANI_HOT_RELOAD=on` with `APP_ENV=prod`.
+- Development: `GALVANI_WORKER_MODE=auto` and `GALVANI_HOT_RELOAD=auto`. The entrypoint
+  checks the filesystem type of `/app`:
+  - Linux filesystem (Linux host, WSL home folder): worker mode, `watch` and hot reload on.
+  - Host folder shared into a VM, or an unknown type: classic mode, no hot reload, so every
+    change is still picked up on reload.
+- Windows developers are pointed to a WSL-based setup ([windows.md](windows.md)), which
+  gives the fast path.
+
+**Consequences:** no per-developer configuration; the startup log states the chosen modes
+and the detected filesystem. `watch` covers `src/`, `config/`, `translations/`, `.env*` and
+`composer.lock`; templates reload on their own, and `var/`/`vendor/` are excluded so cache
+writes cannot trigger restart loops. `on`/`off` still force a mode, for example to test
+worker-mode behaviour on a Windows folder.
 
 ## ADR-7: Mercure secure by default
 
@@ -138,3 +150,19 @@ no anonymous subscribers and no subscription API, and the issuer is bound to
 **Consequences:** subscribers need a JWT, which MercureBundle provides. The hub keeps its
 history in the default local (bolt) transport inside the `php` container. Running several
 `php` replicas requires a shared transport (Mercure Enterprise / Cloud).
+
+## ADR-8: Frontend assets without Node by default
+
+**Context:** Symfony apps typically need CSS tooling (Tailwind, component libraries such as
+daisyUI). Adding Node to the stack brings a second toolchain, `node_modules`, npm supply
+chain exposure and an extra build stage.
+
+**Decision:** the template supports Symfony's AssetMapper with `symfonycasts/tailwind-bundle`,
+which downloads the standalone Tailwind binary. daisyUI 5 ships a standalone plugin file
+for that binary. The prod build runs `tailwind:build --minify` when the bundle is installed,
+and dev has a `tailwind` watcher service that idles until it is.
+
+**Consequences:** no Node in the base image or the stack. Apps with substantial JavaScript
+(TypeScript, React/Vue, many npm packages) can add a bundler such as Rsbuild or Vite as an
+app-level choice: a separate Node service in dev and a Node build stage in the app's
+Dockerfile, keeping the PHP image Node-free.
