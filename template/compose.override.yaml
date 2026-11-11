@@ -192,7 +192,7 @@ services:
       - "127.0.0.1:${MAILPIT_UI_PORT:-8025}:8025"
 
   adminer:
-    image: docker.io/library/adminer:5
+    image: docker.io/library/adminer:6
     restart: unless-stopped
     security_opt:
       - no-new-privileges:true
